@@ -1,3 +1,21 @@
+// ---------------------------------------------------------------------------
+// esp32cam-rtsp-prusaConnect Firmware
+//
+// Provides a web-configurable ESP32-CAM application that:
+//   * Serves an MJPEG stream over RTSP
+//   * Delivers snapshots via HTTP and pushes them to Prusa Connect
+//   * Supports over-the-air updates and local configuration via IotWebConf
+//
+// File structure:
+//   1. includes & constant definitions
+//   2. IotWebConf parameter declarations
+//   3. global object and state variables
+//   4. HTTP handler implementations
+//   5. camera initialization/utility helpers
+//   6. Wi‑Fi/OTA callbacks
+//   7. setup() and loop() Arduino routines
+// ---------------------------------------------------------------------------
+
 #include <Arduino.h>
 #include <ArduinoOTA.h>
 #include <esp_wifi.h>
@@ -17,26 +35,61 @@
 #include <format_number.h>
 #include <moustache.h>
 #include <settings.h>
+#include <mbedtls/sha1.h>   // ESP32 includes this
 
 extern "C" uint8_t temprature_sens_read();
 
 #define FREQ_STRING_LEN 5
-static const char pcfreqValues[][FREQ_STRING_LEN]={"10","30","60"};
-static const char pcfreqNames[][FREQ_STRING_LEN]={"10 s","30 s","60 s"};
+static const char pcfreqValues[][FREQ_STRING_LEN] = {"10", "30", "60"};
+static const char pcfreqNames[][FREQ_STRING_LEN] = {"10 s", "30 s", "60 s"};
 
+// ---------------------------------------------------------------------------
+// Utility function to generate a unique fingerprint based on the device's MAC address
+
+
+String generate_fingerprint() {
+    uint8_t mac[6];
+    esp_efuse_mac_get_default(mac);
+    
+    uint8_t hash[20];
+    mbedtls_sha1_context ctx;
+    mbedtls_sha1_init(&ctx);
+    mbedtls_sha1_starts(&ctx);
+    mbedtls_sha1_update(&ctx, mac, 6);
+    mbedtls_sha1_finish(&ctx, hash);
+    mbedtls_sha1_free(&ctx);
+    
+    char fingerprint[41];  // 40 hex chars + null
+    for (int i = 0; i < 20; i++) {
+        sprintf(&fingerprint[i*2], "%02x", hash[i]);
+    }
+    return String(fingerprint);
+}
+
+// ---------------------------------------------------------------------------
+// Web content resources embedded in the binary
+// ---------------------------------------------------------------------------
 // HTML files
 extern const char index_html_min_start[] asm("_binary_html_index_min_html_start");
 extern const char restart_html_min_start[] asm("_binary_html_restart_min_html_start");
 
+// ---------------------------------------------------------------------------
+// IotWebConf parameter definitions
+// ---------------------------------------------------------------------------
+
 auto param_group_board = iotwebconf::ParameterGroup("board", "Board settings");
 auto param_board = iotwebconf::Builder<iotwebconf::SelectTParameter<sizeof(camera_configs[0])>>("bt").label("Board").optionValues((const char *)&camera_configs).optionNames((const char *)&camera_configs).optionCount(sizeof(camera_configs) / sizeof(camera_configs[0])).nameLength(sizeof(camera_configs[0])).defaultValue(DEFAULT_CAMERA_CONFIG).build();
 
-auto param_group_prusaconnect = iotwebconf::ParameterGroup("prusac","Prusa Connect");
+auto param_group_prusaconnect = iotwebconf::ParameterGroup("prusac", "Prusa Connect");
 auto param_prusaconnect_url = iotwebconf::Builder<iotwebconf::TextTParameter<255>>("pcu").label("Prusa Connect URL").defaultValue(PRUSACONNECT_URL).build();
 auto param_prusaconnect_fingerprint = iotwebconf::Builder<iotwebconf::TextTParameter<64>>("pcfpt").label("Prusa Connect fingerprint").defaultValue(PC_FINGERPRINT).build();
 auto param_prusaconnect_token = iotwebconf::Builder<iotwebconf::TextTParameter<32>>("pctkn").label("Prusa Connect token").defaultValue(PC_TOKEN).build();
 auto param_prusaconnect_freq = iotwebconf::Builder<iotwebconf::SelectTParameter<FREQ_STRING_LEN>>("pcfcy").label("Refresh frequency").optionValues((const char *)pcfreqValues).optionNames((const char *)pcfreqNames).optionCount(sizeof(pcfreqValues) / sizeof(FREQ_STRING_LEN)).nameLength(FREQ_STRING_LEN).defaultValue(DEFAULT_SNAP_FREQUENCY).build();
 auto param_prusaconnect_flash = iotwebconf::Builder<iotwebconf::CheckboxTParameter>("pcflsh").label("Use flash").defaultValue(DEFAULT_USEFLASH).build();
+
+// Note: these parameters are added to the config portal, but not stored in the config file as they contain sensitive information. This is done by not adding them to any parameter group.
+auto param_printer_ip = iotwebconf::Builder<iotwebconf::TextTParameter<16>>("pip").label("Printer IP Address").defaultValue("").build();
+auto param_printer_api_key = iotwebconf::Builder<iotwebconf::TextTParameter<32>>("pak").label("Printer API Key").defaultValue("").build();
 
 auto param_group_camera = iotwebconf::ParameterGroup("camera", "Camera settings");
 auto param_frame_duration = iotwebconf::Builder<iotwebconf::UIntTParameter<unsigned long>>("fd").label("Frame duration (ms)").defaultValue(DEFAULT_FRAME_DURATION).min(10).build();
@@ -70,6 +123,9 @@ auto param_colorbar = iotwebconf::Builder<iotwebconf::CheckboxTParameter>("cb").
 auto param_group_peripheral = iotwebconf::ParameterGroup("io", "peripheral settings");
 auto param_led_intensity = iotwebconf::Builder<iotwebconf::UIntTParameter<byte>>("li").label("LED intensity").defaultValue(DEFAULT_LED_INTENSITY).min(0).max(100).build();
 
+// ---------------------------------------------------------------------------
+// Global object instances and runtime state
+// ---------------------------------------------------------------------------
 // Camera
 OV2640 cam;
 // DNS Server
@@ -81,17 +137,164 @@ WebServer web_server(80);
 // Http Client
 HTTPClientJPG httpc;
 
+//
+unsigned long lastPrinterCheck = 0;
+
+// Forward declarations
+void start_rtsp_server();
+void update_camera_settings();
+
+// timestamp of last Prusa Connect snapshot; used to rate-limit requests
 uint32_t previousTrigger = 0;
 
+// derive a unique thing name from SSID and MAC address
 auto thingName = String(WIFI_SSID) + "-" + String(ESP.getEfuseMac(), 16);
 IotWebConf iotWebConf(thingName.c_str(), &dnsServer, &web_server, WIFI_PASSWORD, CONFIG_VERSION);
 
+// runtime flags
 // Keep track of config changes. This will allow a reset of the device
 bool config_changed = false;
-// connection to prusa connect
+// connection status to prusa connect server
 bool prusa_connect_link = false;
-// Camera initialization result
+// result returned by initialize_camera()
 esp_err_t camera_init_result;
+
+// Printer state tracking
+bool printer_is_printing = true; // assume printing until we know otherwise
+unsigned long last_printer_check = 0;
+const unsigned long PRINTER_CHECK_INTERVAL = 5000; // Check every 5 seconds
+
+/// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
+
+// Checks printer state by querying the printer API. Returns true if printing, false if idle.
+bool check_printer_state()
+{
+  if (String(param_printer_ip.value()).isEmpty())
+  {
+    log_i("Printer IP not set – assuming printing");
+    return true;
+  }
+
+  WiFiClient client;
+  String host = String(param_printer_ip.value());
+  String path = "/api/printer";
+
+  log_i("Checking printer at %s", host.c_str());
+
+  if (!client.connect(host.c_str(), 80))
+  {
+    log_w("Printer connection failed");
+    return true;
+  }
+
+  client.print("GET " + path + " HTTP/1.1\r\n");
+  client.print("Host: " + host + "\r\n");
+  if (!String(param_printer_api_key.value()).isEmpty())
+  {
+    client.print("X-Api-Key: " + String(param_printer_api_key.value()) + "\r\n");
+  }
+  client.print("Connection: close\r\n\r\n");
+
+  unsigned long timeout = millis() + 3000;
+  while (!client.available() && millis() < timeout)
+    delay(10);
+
+  if (!client.available())
+  {
+    log_w("Printer response timeout");
+    client.stop();
+    return true;
+  }
+
+  String statusLine = client.readStringUntil('\n');
+  log_i("Printer HTTP status: %s", statusLine.c_str());
+
+  // Skip headers
+  while (client.available())
+  {
+    String line = client.readStringUntil('\n');
+    if (line == "\r")
+      break;
+  }
+
+  String payload = "";
+  while (client.available())
+    payload += client.readString();
+  client.stop();
+
+  log_i("Printer payload: %s", payload.c_str()); // ← SEE WHAT THE PRINTER RETURNS
+
+  // Determine printing state based on response content. This may need to be adjusted based on the actual API response structure.
+
+  bool is_printing = (payload.indexOf("\"printing\":true") > 0);
+
+  log_i("Printer is %s", is_printing ? "PRINTING" : "IDLE");
+  return is_printing;
+}
+void enter_low_power_mode()
+{
+  log_i("Entering low power mode - printer idle");
+
+  // Turn off flash LED immediately
+  analogWrite(LED_FLASH, 0);
+
+  // Stop RTSP server if running
+  if (camera_server)
+  {
+    camera_server.reset(nullptr);
+    log_i("RTSP server stopped");
+  }
+
+  // Reduce camera power consumption
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor)
+  {
+    // Store current values to restore later
+    static int saved_brightness, saved_contrast, saved_saturation;
+    saved_brightness = sensor->status.brightness;
+    saved_contrast = sensor->status.contrast;
+    saved_saturation = sensor->status.saturation;
+
+    // Set minimum power settings
+    sensor->set_brightness(sensor, -2); // Minimum brightness
+    sensor->set_contrast(sensor, -2);   // Minimum contrast
+    sensor->set_saturation(sensor, -2); // Minimum saturation
+    sensor->set_gain_ctrl(sensor, 0);   // Disable gain control
+    sensor->set_agc_gain(sensor, 0);    // Minimum gain
+    sensor->set_aec_value(sensor, 0);   // Minimum exposure
+  }
+
+  // Reduce WiFi power but stay connected
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); // ~8.5 dBm (minimum)
+  log_i("WiFi power reduced");
+}
+
+void exit_low_power_mode()
+{
+  log_i("Exiting low power mode - printer active");
+
+  // Restore flash LED setting
+  analogWrite(LED_FLASH, param_led_intensity.value());
+
+  // Restart RTSP server if camera is initialized
+  if (camera_init_result == ESP_OK && WiFi.status() == WL_CONNECTED)
+  {
+    start_rtsp_server();
+  }
+
+  // Restore camera settings from configuration
+  update_camera_settings();
+
+  // Restore WiFi power
+  WiFi.setTxPower(WIFI_POWER_19_5dBm); // Maximum power
+  log_i("WiFi power restored");
+}
+
+// ---------------------------------------------------------------------------
+// HTTP handler and utility functions
+// ---------------------------------------------------------------------------
 
 void stream_text_file_gzip(const unsigned char *content, size_t length, const char *mime_type)
 {
@@ -151,12 +354,12 @@ void handle_root()
       {"IpV6", ipv6.toString()},
       {"NetworkState.ApMode", String(iotWebConf.getState() == iotwebconf::NetworkState::ApMode)},
       {"NetworkState.OnLine", String(iotWebConf.getState() == iotwebconf::NetworkState::OnLine)},
-      //Prusa Connect
-      {"PrusaConnectUrl",String(param_prusaconnect_url.value())},
+      // Prusa Connect
+      {"PrusaConnectUrl", String(param_prusaconnect_url.value())},
       {"FingerPrint", String(param_prusaconnect_fingerprint.value())},
       {"Token", String(param_prusaconnect_token.value())},
       {"SnapFrequency", String(param_prusaconnect_freq.value())},
-      {"PcFlash",String(param_prusaconnect_flash.value())},
+      {"PcFlash", String(param_prusaconnect_flash.value())},
       {"PcConnected", String(prusa_connect_link)},
       // Camera
       {"BoardType", String(param_board.value())},
@@ -202,6 +405,7 @@ void handle_root()
   web_server.send(200, "text/html", html);
 }
 
+// Handler for restarting the device, with authentication and a friendly message while waiting  for the restart to complete
 void handle_restart()
 {
   log_v("Handle restart");
@@ -217,13 +421,17 @@ void handle_restart()
       {"AppVersion", APP_VERSION},
       {"ThingName", iotWebConf.getThingName()}};
 
-  auto html = moustache_render(restart_html_min_start, substitutions);
+  String html = moustache_render(restart_html_min_start, substitutions);
+
+  // Ensure the response is fully sent before restarting
+  web_server.sendHeader("Content-Length", String(html.length()));
   web_server.send(200, "text/html", html);
-  log_v("Restarting... Press refresh to connect again");
-  sleep(200);
+  web_server.client().flush(); // wait for all data to be transmitted
+  delay(500);                  // give the browser time to receive it
+
+  log_v("Restarting...");
   iotWebConf.goOffLine();
-  sleep(1000);
-  ESP.deepSleep(0);
+  delay(100);
   ESP.restart();
 }
 
@@ -266,11 +474,10 @@ void trigger_prusaConnect()
 
   if (param_prusaconnect_flash.value() == true)
   {
-    // Set flash led intensity
-    analogWrite(LED_FLASH, 255);
+    analogWrite(LED_FLASH, 255); // flash on
   }
 
-  // Remove old images stored in the frame buffer
+  // Remove old images from frame buffer
   auto frame_buffers = param_frame_buffers.value();
   while (frame_buffers--)
     cam.run();
@@ -282,35 +489,53 @@ void trigger_prusaConnect()
     log_v("Unable to obtain frame buffer from the camera");
     if (param_prusaconnect_flash.value() == true)
     {
-      // Set flash led intensity
       analogWrite(LED_FLASH, param_led_intensity.value());
     }
     return;
   }
 
+  // Prepare HTTP client and headers
   httpc.begin(param_prusaconnect_url.value());
-  httpc.addHeader("accept","*/*");
+  httpc.addHeader("accept", "*/*");
   httpc.addHeader("Cache-Control", "no-cache");
-  httpc.addHeader("content-type","image/jpg");
-  httpc.addHeader("fingerprint",param_prusaconnect_fingerprint.value());
-  httpc.addHeader("token",param_prusaconnect_token.value());
-  int resulthttp=httpc.sendRequest("PUT",fb, (size_t)fb_len);
-  prusa_connect_link = httpc.connected();
-  if ((resulthttp >= 200) && (resulthttp < 300))
+  httpc.addHeader("content-type", "image/jpg");
+
+  // Use provided fingerprint or generate one if not set
+  String fingerprint = String(param_prusaconnect_fingerprint.value());
+  if (fingerprint.isEmpty())
   {
-    log_v("SNAPSHOT SENT");
+    fingerprint = generate_fingerprint();
+    log_v("Using auto-generated fingerprint: %s", fingerprint.c_str());
+  }
+  httpc.addHeader("fingerprint", fingerprint);
+  
+  httpc.addHeader("token", param_prusaconnect_token.value());
+
+  int resulthttp = httpc.sendRequest("PUT", fb, (size_t)fb_len);
+
+  // Update connection status based on HTTP result
+  if (resulthttp >= 200 && resulthttp < 300)
+  {
+    log_i("Snapshot upload SUCCESS, HTTP %d", resulthttp);
+    prusa_connect_link = true;
   }
   else
   {
-    log_v("Erreur sending snapshot. Http Error: %d", resulthttp);
-    //log_v("payload: %s",httpc.getString());
+    log_w("Snapshot upload FAILED, HTTP %d", resulthttp);
+    prusa_connect_link = false;
+    // Optional: print response body for debugging
+    String response = httpc.getString();
+    if (response.length() > 0)
+    {
+      log_i("Response body: %s", response.c_str());
+    }
   }
+
   httpc.end();
 
   if (param_prusaconnect_flash.value() == true)
   {
-    // Set flash led intensity
-    analogWrite(LED_FLASH, param_led_intensity.value());
+    analogWrite(LED_FLASH, param_led_intensity.value()); // restore flash intensity
   }
 }
 
@@ -330,6 +555,7 @@ void handle_stream()
   char size_buf[12];
   auto client = web_server.client();
   client.write("HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: multipart/x-mixed-replace; boundary=" STREAM_CONTENT_BOUNDARY "\r\n");
+  // continuously send frames until the client disconnects
   while (client.connected())
   {
     client.write("\r\n--" STREAM_CONTENT_BOUNDARY "\r\n");
@@ -370,6 +596,10 @@ void handle_flash()
   web_server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   web_server.send(200);
 }
+
+// ---------------------------------------------------------------------------
+// Camera initialization and control helpers
+// ---------------------------------------------------------------------------
 
 esp_err_t initialize_camera()
 {
@@ -446,6 +676,10 @@ void start_rtsp_server()
   // HTTP is already set by iotWebConf
   MDNS.addService("rtsp", "tcp", 554);
 }
+
+// ---------------------------------------------------------------------------
+// Wi‑Fi / configuration callbacks
+// ---------------------------------------------------------------------------
 
 void on_connected()
 {
@@ -538,6 +772,11 @@ void setup()
   param_group_prusaconnect.addItem(&param_prusaconnect_token);
   param_group_prusaconnect.addItem(&param_prusaconnect_freq);
   param_group_prusaconnect.addItem(&param_prusaconnect_flash);
+
+  // Note: these parameters are added to the config portal, but not stored in the config file as they contain sensitive information. This is done by not adding them to any parameter group.
+  param_group_prusaconnect.addItem(&param_printer_ip);
+  param_group_prusaconnect.addItem(&param_printer_api_key);
+
   iotWebConf.addParameterGroup(&param_group_prusaconnect);
 
   iotWebConf.getApTimeoutParameter()->visible = true;
@@ -564,8 +803,29 @@ void setup()
   // Camera flash light
   web_server.on("/flash", HTTP_GET, handle_flash);
 
+  // web_server.onNotFound([]()
+  //{ iotWebConf.handleNotFound(); });
+
+  // Custom not found handler to properly handle API and static file requests, and show a friendly message if the device is still booting
   web_server.onNotFound([]()
-                        { iotWebConf.handleNotFound(); });
+                        {
+    String uri = web_server.uri();
+    
+    // Handle API and static file requests properly
+    if (uri.startsWith("/api/") || uri.endsWith(".css") || 
+        uri.endsWith(".js") || uri.endsWith(".ico") || uri.endsWith(".png")) {
+        web_server.send(404, "text/plain", "Not found");
+        return;
+    }
+    
+    // If the device just booted (first 5 seconds), show a friendly "booting" page
+    if (millis() < 5000) {
+        String html = "<html><head><meta http-equiv='refresh' content='2'></head>"
+                      "<body><h1>Device booting...</h1><p>Please wait.</p></body></html>";
+        web_server.send(503, "text/html", html);
+    } else {
+        handle_root();   // serve the main status page for any unknown route
+    } });
 
   ArduinoOTA
       .setPassword(OTA_PASSWORD)
@@ -591,25 +851,42 @@ void setup()
   analogWrite(LED_FLASH, param_led_intensity.value());
 }
 
+// ---------------------------------------------------------------------------
 void loop()
 {
   iotWebConf.doLoop();
   ArduinoOTA.handle();
 
-  if (camera_server)
-    camera_server->doLoop();
-  
-  if (iotWebConf.getState() == 4) //OnLine
+  // Run printer check every 10 seconds when online
+  if (iotWebConf.getState() == 4 && (millis() - lastPrinterCheck > 10000))
   {
-    if ((!String(param_prusaconnect_fingerprint.value()).isEmpty()) && (!String(param_prusaconnect_token.value()).isEmpty()))
+    bool was_printing = printer_is_printing;
+    printer_is_printing = check_printer_state();
+    lastPrinterCheck = millis();
+
+    if (was_printing && !printer_is_printing)
     {
-      if ((millis() - previousTrigger) >= String(param_prusaconnect_freq.value()).toInt()*1000)
-      {
-        trigger_prusaConnect();
-        previousTrigger = millis();
-      }
+      enter_low_power_mode();
+    }
+    else if (!was_printing && printer_is_printing)
+    {
+      exit_low_power_mode();
     }
   }
 
+  if (camera_server)
+    camera_server->doLoop();
+
+  // Only trigger snapshots when printer is printing
+  if (printer_is_printing && iotWebConf.getState() == 4) {
+    // Always allow upload – token is required, but fingerprint can be auto‑generated
+    if (!String(param_prusaconnect_token.value()).isEmpty()) {
+        unsigned long freq_ms = String(param_prusaconnect_freq.value()).toInt() * 1000;
+        if ((millis() - previousTrigger) >= freq_ms) {
+            trigger_prusaConnect();
+            previousTrigger = millis();
+        }
+    }
+} 
   yield();
 }
