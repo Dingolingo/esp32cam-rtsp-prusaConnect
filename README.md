@@ -1,3 +1,52 @@
+# ESP32-CAM RTSP for PrusaConnect
+
+This project adapts the ESP32-CAM RTSP firmware to integrate with PrusaConnect.
+
+It adds:
+- The camera only takes images when the printer is running (done)
+- Better interface behaviour on restart (done)
+- Automatic pickup of fingerprint (done)
+- Better usability through tooltips and additional notes
+- extended camera configuration
+- schema-driven UI configuration
+
+## Original Project
+
+This work is based on the excellent ESP32-CAM RTSP firmware by:
+
+oguegan
+
+Original repository:
+[https://github.com/<original project>](https://github.com/oguegan/esp32cam-rtsp-prusaConnect)
+
+This repository extends the project to support PrusaConnect integration and schema-based configuration.
+
+## Features
+
+• RTSP streaming
+• Web configuration interface
+• PrusaConnect integration
+• Extended camera controls
+• Schema-driven parameter system
+
+## Hardware
+
+Tested with:
+- ESP32-CAM (AI Thinker)
+
+## Installation
+
+1 Clone the repository
+2 Open in PlatformIO
+3 Flash firmware to ESP32-CAM
+4 Configure WiFi via web interface
+
+## Development Status
+
+The project is currently migrating to a new schema-based ID system for configuration parameters.
+
+________________________________________________________________________________________________________________________________________________________________________________
+
 # ESP32CAM-RTSP-PrusaConnect :video_camera:
 
 [![Platform IO CI](https://github.com/rzeldent/esp32cam-rtsp/actions/workflows/main.yml/badge.svg)](https://github.com/rzeldent/esp32cam-rtsp/actions/workflows/main.yml)
