@@ -17,7 +17,9 @@ This work is based on the excellent ESP32-CAM RTSP firmware by:
 oguegan
 
 Original repository:
-[https://github.com/<original project>](https://github.com/oguegan/esp32cam-rtsp-prusaConnect)
+https://github.com/oguegan/esp32cam-rtsp-prusaConnect
+Before that:
+https://github.com/rzeldent/esp32cam-rtsp
 
 This repository extends the project to support PrusaConnect integration and schema-based configuration.
 
